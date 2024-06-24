@@ -1,0 +1,140 @@
+pipeline {
+    agent any
+tools
+    {
+        nodejs "nodejs"
+    }
+    
+    environment{
+        SCANNER_HOME= tool 'sonar-scanner'
+        Deploy_Creds=credentials("13.54.14.255")
+
+    }
+    stages {
+        stage('Git Checkout') {
+            steps {
+                git 'https://github.com/Junaid414/docker-frontend-backend-db.git'
+            }
+        }
+        
+        stage('Install Dependencies Front End') {
+            steps {
+                sh "cd backend && npm install"
+                sh "cd frontend && npm install"
+            }
+        }
+        stage('Testing Stage') {
+            steps {
+                echo "Running Unit Test"
+               /* sh "cd frontend && npm test" */
+            }
+        }
+        
+        stage('OWASP Dependency Check') {
+            steps {
+                dependencyCheck additionalArguments: ''' 
+                    -o './'
+                    -s './'
+                    -f 'ALL' 
+                    --prettyPrint''', nvdCredentialsId: 'nvd-api',odcInstallation: 'DP'
+              dependencyCheckPublisher pattern: 'dependency-check-report.xml'    
+        
+         /*   dependencyCheckPublisher pattern: 'dependency-check-report.xml', unstableTotalCritical: 1, unstableTotalHigh: 1        
+            
+
+                script {
+                    if (currentBuild.result != "SUCCESS") {
+                        error("Dependency Check failed")
+                    }
+                }*/
+        }
+        }
+        
+        stage('SonarQube SAST') {
+            steps {
+               withSonarQubeEnv('sonar') {
+                sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectKey=Demo -Dsonar.projectName=Demo \
+                -Dsonar.java.binaries=. '''
+                }
+            }
+        }
+        
+        stage("Quality Gate") {
+            steps {
+            withSonarQubeEnv('sonar') {
+              timeout(time: 1, unit: 'HOURS') {
+                waitForQualityGate abortPipeline: true
+              }
+            }
+            }
+          }
+         stage('Trivy Code Scan') {
+            steps {
+                /*sh 'trivy fs --no-progress --exit-code 1 --severity HIGH,CRITICAL --format table -o fs-report.html .'*/
+                sh 'trivy fs --format table -o trivy_report.html .'
+                /*script {
+                    // Run Trivy to scan the Docker image
+                    def trivyOutput = sh(script: "trivy fs --format table -o trivy_report.html .", returnStdout: true).trim()
+
+                    echo ${trivyOutput}
+
+                    if (trivyOutput.contains("Total: 0")) {
+                        echo "No vulnerabilities found "
+                    } else {
+                        echo "Vulnerabilities found."
+                    }
+                } */
+            }
+        } 
+        
+        stage('Docker Build & Publish ') {
+            steps {
+                
+                script{
+                    withDockerRegistry(credentialsId: 'dockerhub', toolName: 'docker') {
+
+                    sh 'docker build -t hasil86/todo-frontend:${BUILD_NUMBER} frontend/.'
+                    sh 'docker build -t hasil86/todo-backend:${BUILD_NUMBER} backend/.'
+                    sh 'docker push hasil86/todo-frontend:${BUILD_NUMBER}'
+                    sh 'docker push hasil86/todo-backend:${BUILD_NUMBER}'
+                        
+                    }
+                }
+            }
+        }
+        stage('EKS Deploy with Helm') {
+            steps {
+                
+                withKubeConfig(caCertificate: '', clusterName: 'my-demo-eks2', contextName: '', credentialsId: 'kubetoken', namespace: 'todo', restrictKubeConfigAccess: false, serverUrl: 'https://F45538AE4E68BB49837795BE84316296.gr7.ap-south-1.eks.amazonaws.com') {
+                sh 'helm upgrade --install myapp helm/ --namespace todo --set web.todoFrontend.image.tag=${BUILD_NUMBER} --set api.todoBackend.image.tag=${BUILD_NUMBER}'
+                sh "sleep 5"
+                sh "kubectl get services -n todo"
+                }
+                
+                /*script{
+                
+                sh 'helm upgrade --install myChart helm/ --namespace todo --set web.todoFrontend.image.tag=${BUILD_NUMBER} --set api.todoBackend.image.tag=${BUILD_NUMBER}'
+                }*/
+            }
+        }
+          
+         
+        
+        
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: "trivy_report.html", fingerprint: true
+                
+            publishHTML (target: [
+                allowMissing: false,
+                alwaysLinkToLastBuild: false,
+                keepAll: true,
+                reportDir: '.',
+                reportFiles: 'trivy_report.html',
+                reportName: 'Trivy Scan',
+                ])
+            }
+        }
+}
+
